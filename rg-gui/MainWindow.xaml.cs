@@ -14,7 +14,9 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Media.Media3D;
 using System.Windows.Threading;
 using static rg_gui.RipGrepWrapper;
 
@@ -51,6 +53,8 @@ namespace rg_gui
         private const int HIGHLIGHT_COLORS_COUNT = 4;
 
         private const double GRID_SPLITTER_WIDTH = 5.0;
+
+        private const int WM_MOUSEWHEEL = 0x020E;
 
         private string m_currentInput = string.Empty;
         private string? m_currentSuggestion = string.Empty;
@@ -197,6 +201,8 @@ namespace rg_gui
 
             m_fileViewerPath = config.AppSettings.Settings["FileViewerPath"]?.Value ?? string.Empty;
             m_fileViewerArgs = config.AppSettings.Settings["FileViewerArgs"]?.Value ?? string.Empty;
+            
+            SourceInitialized += MainWindow_SourceInitialized;
         }
 
         private static void SetConfigValue(Configuration config, string key, string value)
@@ -287,6 +293,55 @@ namespace rg_gui
             {
                 txtFileListStatus.Text = $"Found {FileResultItems.Count} files.";
             }
+        }
+        
+        private void MainWindow_SourceInitialized(object? sender, EventArgs e)
+        {
+            if (PresentationSource.FromVisual(this) is HwndSource hwndSource)
+            {
+                hwndSource.AddHook(WndProc);
+            }
+        }
+        
+        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WM_MOUSEWHEEL)
+            {
+                // The high-order word of wParam holds the signed horizontal wheel delta.
+                var delta = (short)((wParam.ToInt64() >> 16) & 0xffff);
+
+                var mousePosition = PointFromScreen(new Point(
+                    (short)(lParam.ToInt64() & 0xffff),
+                    (short)((lParam.ToInt64() >> 16) & 0xffff)
+                ));
+                
+                var hit = InputHitTest(mousePosition) as DependencyObject;
+                var scrollViewer = FindAncestorScrollViewer(hit);
+                
+                if (scrollViewer != null)
+                {
+                    // Positive delta = tilt right, negative = tilt left.
+                    scrollViewer.ScrollToHorizontalOffset(scrollViewer.HorizontalOffset + (delta > 0 ? + 40 : -40));
+                    handled = true;
+                }
+            }
+            
+            return IntPtr.Zero;
+        }
+        
+        private static ScrollViewer? FindAncestorScrollViewer(DependencyObject? element)
+        {
+            while (element != null)
+            {
+                if (element is ScrollViewer scrollViewer)
+                {
+                    return scrollViewer;
+                }
+                element = (element is Visual || element is Visual3D) 
+                    ? VisualTreeHelper.GetParent(element) 
+                    : LogicalTreeHelper.GetParent(element);
+            }
+            return null;
         }
 
         private void gridFileResults_MouseDown(object? sender, MouseEventArgs e)
