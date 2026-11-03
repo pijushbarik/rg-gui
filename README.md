@@ -9,9 +9,9 @@
 
 Download the latest release of rg-gui from the [Releases page](https://github.com/kcowolf/rg-gui/releases).  Unzip it to a convenient location such as `C:\rg-gui`.
 
-The RipGrep executable `rg.exe` is included in the rg-gui release.  It needs to be in the same folder as `rg-gui.exe`.
+rg-gui first looks for it in your `PATH`; if it is not found there, it looks in the same folder as `rg-gui.exe`. You can [install ripgrep](<https://github.com/BurntSushi/ripgrep#installation>] or simply copy `rg.exe` next to `rg-gui.exe`. If neither is found, an error is shown.
 
-The **.NET Desktop Runtime 8** must also be installed.  You can download it from here: https://dotnet.microsoft.com/en-us/download/dotnet/8.0
+The **.NET Desktop Runtime 8** must also be installed.  You can download it from here: <https://dotnet.microsoft.com/en-us/download/dotnet/8.0>
 
 ## Usage
 
@@ -22,6 +22,8 @@ Include Files and Exclude Files can be path or file names and can include wildca
 Folders can be added to the include/exclude list.  For example, excluding `\.git;\bin;\obj;*.exe;*.dll` will ignore any files in a subfolder named .git, bin, or obj, as well as any files with a .exe or .dll extension.
 
 Finally, type the text you would like to search for in the "Containing Text" box.  Press the Start button to start your search.
+
+The **Split into terms** option controls how the text is interpreted. When checked, words separated by space are searched as separate terms (use double quotes to keep a phrase together); a file is listed only if every term matches somewhere in it, and each term is highlighted in its own color. When unchecked, the entire text is searched as one phrase and no quoting is needed.
 
 ### File results
 
@@ -91,7 +93,7 @@ For Notepad++, set the arguments to: `-n$LINE $FILE`
 rg-gui was written by Benjamin Stauffer (kcowolf).
 
 Icon based on Line Hero Unlimited v2.4.1 - 02032020, file_find_search.png
-https://wishforge.itch.io/3000-free-icons
+<https://wishforge.itch.io/3000-free-icons>
 
 Special thanks to Andrew Gallant (BurntSushi) for the [RipGrep](https://github.com/BurntSushi/ripgrep) tool.
 
@@ -99,4 +101,4 @@ Theme engine based on [WPFDarkTheme](https://github.com/AngryCarrot789/WPFDarkTh
 
 ## License
 
-All files are distributed under the [MIT License](LICENSE) unless otherwise specified.  ShellContextMenu.cs is licensed under The Code Project Open License (CPOL) 1.02, https://www.codeproject.com/info/cpol10.aspx.  SHOpenFolderAndSelectItems.cs is licensed under the BSD 2-Clause License, BSD 2-Clause License, https://opensource.org/license/bsd-2-clause.
+All files are distributed under the [MIT License](LICENSE) unless otherwise specified.  ShellContextMenu.cs is licensed under The Code Project Open License (CPOL) 1.02, <https://www.codeproject.com/info/cpol10.aspx>.  SHOpenFolderAndSelectItems.cs is licensed under the BSD 2-Clause License, BSD 2-Clause License, <https://opensource.org/license/bsd-2-clause>.

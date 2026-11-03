@@ -66,14 +66,73 @@ namespace rg_gui
             public ConcurrentBag<TermResult> TermResults { get; }
         }
 
-        public readonly ConcurrentBag<(string path, string filename, int termIndex)> FilesFound = new();
-        public readonly ConcurrentDictionary<(string path, string filename, int lineNumber), LineResult> FileResults = new();
+        private class FileEntry
+        {
+            public readonly ConcurrentDictionary<int, LineResult> Lines = new();
+            
+            // Guarded by lock (this)
+            private readonly HashSet<int> m_termsMatched = new();
+            private bool m_raised;
+            
+            // Returns true exactly once, when every search term has matched in this file.
+            public bool MarkTermMatched(int termIndex, int searchTermCount)
+            {
+                lock (this)
+                {
+                    m_termsMatched.Add(termIndex);
+                    if (!m_raised && m_termsMatched.Count == searchTermCount)
+                    {
+                        m_raised = true;
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+        
+        private readonly ConcurrentDictionary<(string path, string filename), FileEntry> m_files = new();
+
         private int m_searchTermCount;
 
         public event EventHandler<(string path, string filename)>? FileFound;
         protected void RaiseFileFound(string path, string filename)
         {
             FileFound?.Invoke(this, (path, filename));
+        }
+        
+        private const string RipGrepExecutable = "rg.exe";
+        
+        // Looks for rg.exe in PATH first, then in installation folder. Returns null if not found.
+        public static string? FindRipGrep()
+        {
+            var pathVariable = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            foreach (var directory in pathVariable.Split(Path.PathSeparator,  StringSplitOptions.RemoveEmptyEntries))
+            {
+                try
+                {
+                    var candidate = Path.Combine(directory.Trim().Trim('"'), RipGrepExecutable);
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+                catch (ArgumentException)
+                {
+                    // Ignore exceptions and continue searching
+                }
+            }
+
+            var installDirectory = Path.GetDirectoryName(Environment.ProcessPath);
+            if (!string.IsNullOrWhiteSpace(installDirectory))
+            {
+                var candidate = Path.Combine(installDirectory, RipGrepExecutable);
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+            
+            return null;
         }
 
         private readonly string m_ripGrepPath;
@@ -85,8 +144,15 @@ namespace rg_gui
 
         public void Clear()
         {
-            FilesFound.Clear();
-            FileResults.Clear();
+            m_files.Clear();
+        }
+        
+        // Returns the line results for a file; empty if the file has none.
+        public IEnumerable<KeyValuePair<int, LineResult>> GetLineResults(string path, string filename)
+        {
+            return m_files.TryGetValue((path, filename), out var entry)
+                ? entry.Lines
+                : Enumerable.Empty<KeyValuePair<int, LineResult>>();
         }
 
         public async Task Search(SearchParameters searchParameters, CancellationToken cancellationToken)
@@ -204,24 +270,18 @@ namespace rg_gui
 
                                     if (!string.IsNullOrWhiteSpace(path) && !string.IsNullOrWhiteSpace(filename))
                                     {
-                                        if (!FilesFound.Contains((path, filename, termIndex)))
+                                        var entry = m_files.GetOrAdd((path, filename), _ => new FileEntry());
+                                        
+                                        if (entry.MarkTermMatched(termIndex, m_searchTermCount))
                                         {
-                                            FilesFound.Add((path, filename, termIndex));
-                                            if (FilesFound.Count(x => x.path == path && x.filename == filename) == m_searchTermCount)
-                                            {
-                                                RaiseFileFound(path, filename);
-                                            }
+                                            RaiseFileFound(path, filename);
                                         }
-
-                                        if (!FileResults.ContainsKey((path, filename, lineNumber)))
+                                        
+                                        var lineResult = entry.Lines.GetOrAdd(lineNumber, _ => new LineResult(RemoveAnsiColors(result[2])));
+                                        
+                                        foreach (var termMatch in GetTermMatches(result[2], termIndex))
                                         {
-                                            FileResults.GetOrAdd((path, filename, lineNumber), new LineResult(RemoveAnsiColors(result[2])));
-                                        }
-
-                                        var termMatches = GetTermMatches(result[2], termIndex);
-                                        foreach (var termMatch in termMatches)
-                                        {
-                                            FileResults[(path, filename, lineNumber)].TermResults.Add(termMatch);
+                                            lineResult.TermResults.Add(termMatch);
                                         }
                                     }
                                 }

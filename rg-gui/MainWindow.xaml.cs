@@ -2,6 +2,7 @@
 using Ookii.Dialogs.Wpf;
 using Peter;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Configuration;
 using System.Diagnostics;
@@ -14,6 +15,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using static rg_gui.RipGrepWrapper;
 
 namespace rg_gui
@@ -37,6 +39,7 @@ namespace rg_gui
         private const bool DEFAULT_CASESENSITIVE = false;
         private const bool DEFAULT_RECURSIVE = true;
         private const bool DEFAULT_REGULAREXPRESSION = false;
+        private const bool DEFAULT_SPLITTERMS = true;
 
         private const string DEFAULT_FILEENCODING = "Auto";
 
@@ -100,6 +103,10 @@ namespace rg_gui
 
         private readonly RipGrepWrapper m_ripGrepWrapper;
 
+        private const int FILE_LIST_REFRESH_MS = 100;
+        private readonly ConcurrentQueue<FileSearchResult> m_pendingFiles = new();
+        private readonly DispatcherTimer m_fileListTimer;
+
         public RangeObservableCollection<FileSearchResult> FileResultItems { get; } = new();
         public RangeObservableCollection<ResultLine> ResultLineItems { get; } = new();
 
@@ -120,7 +127,8 @@ namespace rg_gui
             txtContainingText.Text = containingText ?? config.AppSettings.Settings["ContainingText"]?.Value ?? DEFAULT_CONTAININGTEXT;
             chkCaseSensitive.IsChecked = bool.TryParse(config.AppSettings.Settings["CaseSensitive"]?.Value, out var caseSensitive) ? caseSensitive : DEFAULT_CASESENSITIVE;
             chkRecursive.IsChecked = bool.TryParse(config.AppSettings.Settings["Recursive"]?.Value, out var recursive) ? recursive : DEFAULT_RECURSIVE;
-
+            chkSplitTerms.IsChecked = bool.TryParse(config.AppSettings.Settings["SplitTerms"]?.Value, out var splitTerms) ? splitTerms : DEFAULT_SPLITTERMS;
+            
             var gridFileResultsWidthStr = config.AppSettings.Settings["GridFileResultsWidth"]?.Value;
             var gridSplitterWidthStr = config.AppSettings.Settings["GridSplitterWidth"]?.Value;
             var gridResultLinesWidthStr = config.AppSettings.Settings["GridResultLinesWidth"]?.Value;
@@ -168,11 +176,12 @@ namespace rg_gui
             m_currentTheme = Enum.TryParse<ThemeType>(config.AppSettings.Settings["Theme"]?.Value, out var themeName) ? themeName : DEFAULT_THEME;
             ThemesController.SetTheme(m_currentTheme);
 
-            var ripgrepPath = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? string.Empty, "rg.exe");
-            if (!File.Exists(ripgrepPath))
+            var ripgrepPath = RipGrepWrapper.FindRipGrep();
+            if (ripgrepPath == null)
             {
-                MessageBox.Show("rg.exe not found in installation path.", "Error");
-                throw new Exception("rg.exe not found in installation path.");
+                const string message = "ripgrep (rg.exe) was not found in your PATH or in the rg-gui installation folder.\n\nPlease install ripgrep (https://github.com/BurntSushi/ripgrep) or place rg.exe in the same folder as rg-gui.exe.";
+                MessageBox.Show(message, "Error");
+                throw new FileNotFoundException(message);
             }
 
             m_maxSearchTerms = int.TryParse(config.AppSettings.Settings["MaxSearchTerms"]?.Value, out var maxSearchTerms) ? maxSearchTerms : DEFAULT_MAXSEARCHTERMS;
@@ -182,6 +191,9 @@ namespace rg_gui
 
             m_ripGrepWrapper = new RipGrepWrapper(ripgrepPath);
             m_ripGrepWrapper.FileFound += OnFileAdded;
+            
+            m_fileListTimer = new DispatcherTimer {  Interval = TimeSpan.FromMilliseconds(FILE_LIST_REFRESH_MS) };
+            m_fileListTimer.Tick += (_, _) => FlushPendingFiles();
 
             m_fileViewerPath = config.AppSettings.Settings["FileViewerPath"]?.Value ?? string.Empty;
             m_fileViewerArgs = config.AppSettings.Settings["FileViewerArgs"]?.Value ?? string.Empty;
@@ -236,6 +248,7 @@ namespace rg_gui
             SetConfigValue(config, "ContainingText", txtContainingText.Text);
             SetConfigValue(config, "CaseSensitive", (chkCaseSensitive.IsChecked ?? DEFAULT_CASESENSITIVE).ToString());
             SetConfigValue(config, "Recursive", (chkRecursive.IsChecked ?? DEFAULT_RECURSIVE).ToString());
+            SetConfigValue(config, "SplitTerms", (chkSplitTerms.IsChecked ?? DEFAULT_SPLITTERMS).ToString());
             SetConfigValue(config, "RegularExpression", (chkRegularExpression.IsChecked ?? DEFAULT_REGULAREXPRESSION).ToString());
 
             SetConfigValue(config, "FileEncoding", ((ComboBoxItem)cmbEncoding.SelectedItem).Name);
@@ -255,15 +268,25 @@ namespace rg_gui
 
         private void OnFileAdded(object? sender, (string path, string filename) result)
         {
-            Application.Current.Dispatcher.Invoke(delegate
+            // Called from the search threads. RipGrepWrapper raises this once per file, so just queue it;
+            // the UI thread drains the queue in batches so the rg output readers never wait on the UI.
+            m_pendingFiles.Enqueue(new FileSearchResult(result.path, result.filename));
+        }
+
+        private void FlushPendingFiles()
+        {
+            var added = false;
+            while (m_pendingFiles.TryDequeue(out var file))
             {
-                // Ensure the same result won't be added multiple times.
-                if (!FileResultItems.Any(x => x.Path == result.path && x.Filename == result.filename))
-                {
-                    FileResultItems.Add(new FileSearchResult(result.path, result.filename));
-                    txtFileListStatus.Text = $"Found {FileResultItems.Count} files.";
-                }
-            });
+                FileResultItems.Add(file);
+                added = true;
+                
+            }
+
+            if (added)
+            {
+                txtFileListStatus.Text = $"Found {FileResultItems.Count} files.";
+            }
         }
 
         private void gridFileResults_MouseDown(object? sender, MouseEventArgs e)
@@ -301,11 +324,9 @@ namespace rg_gui
 
                     ResultLineItems.Reset(Enumerable.Empty<ResultLine>());
 
-                    var lineResults = m_ripGrepWrapper.FileResults.Where(x => x.Key.path == addedItem.Path && x.Key.filename == addedItem.Filename);
-
-                    foreach (var lineResult in lineResults)
+                    foreach (var lineResult in m_ripGrepWrapper.GetLineResults(addedItem.Path, addedItem.Filename))
                     {
-                        ResultLineItems.Add(new ResultLine(lineResult.Key.lineNumber, GetColorizedString(lineResult.Value.LineContent, lineResult.Value.TermResults).Trim()));
+                        ResultLineItems.Add(new ResultLine(lineResult.Key, GetColorizedString(lineResult.Value.LineContent, lineResult.Value.TermResults).Trim()));
                     }
 
                     txtResultLineStatus.Text = $"{ResultLineItems.Count} lines matched.";
@@ -383,8 +404,20 @@ namespace rg_gui
                 return;
             }
 
-            // Based on https://stackoverflow.com/questions/52194058/regex-with-escaped-double-quotes
-            var searchTerms = Regex.Matches(txtContainingText.Text, @"""[^""\\]*(?:\\.[^""\\]*)*""|([^\s])+|[^\s""]+");
+            List<string> searchTerms;
+            if (chkSplitTerms.IsChecked ?? DEFAULT_SPLITTERMS)
+            {
+                // Based on https://stackoverflow.com/questions/52194058/regex-with-escaped-double-quotes
+                searchTerms = Regex.Matches(txtContainingText.Text, @"""[^""\\]*(?:\\.[^""\\]*)*""|([^\s])+|[^\s""]+")
+                    .Cast<Match>().Select(x => x.Value).ToList();
+            }
+            else
+            {
+                // Search the whole text as a single phrase.
+                var phrase = txtContainingText.Text.Trim();
+                searchTerms = phrase.Length > 0 ? new List<string> { QuoteArgument(phrase) } : new List<string>();
+            }
+
             if (searchTerms.Count < 1)
             {
                 return;
@@ -414,6 +447,7 @@ namespace rg_gui
             txtResultLineStatus.Text = string.Empty;
 
             m_ripGrepWrapper.Clear();
+            m_pendingFiles.Clear();
 
             var startPath = txtBasePath.Text;
             if (startPath.EndsWith(Path.DirectorySeparatorChar))
@@ -426,7 +460,7 @@ namespace rg_gui
                 var searchParameters = new SearchParameters
                 {
                     StartPath = startPath,
-                    SearchStrings = searchTerms.Cast<Match>().Select(x => x.Value),
+                    SearchStrings = searchTerms,
                     IgnoreCase = !(chkCaseSensitive.IsChecked ?? false),
                     Recursive = chkRecursive.IsChecked ?? true,
                     IncludePatterns = txtIncludeFiles.Text,
@@ -439,10 +473,13 @@ namespace rg_gui
 
                 FileResultItems.Reset(Enumerable.Empty<FileSearchResult>());
 
+                m_fileListTimer.Start();
                 await m_ripGrepWrapper.Search(searchParameters, cancellationTokenSource.Token);
             }
             finally
             {
+                m_fileListTimer.Stop();
+                FlushPendingFiles();
                 btnCancel.IsEnabled = false;
                 btnStart.IsEnabled = true;
                 btnSettings.IsEnabled = true;
@@ -453,6 +490,14 @@ namespace rg_gui
 
             stopwatch.Stop();
             txtFileListStatus.Text = $"Found {FileResultItems.Count} files.  Took {stopwatch.Elapsed.TotalSeconds:0.00} seconds.";
+        }
+        
+        // Wraps text as a single command-line argument using Windows quoting rules.
+        private static string QuoteArgument(string text)
+        {
+            var escaped = Regex.Replace(text, @"(\\*)""", @"$1$1\""");
+            escaped = Regex.Replace(escaped, @"(\\+)$", @"$1$1");
+            return $"\"{escaped}\"";
         }
 
         private void btnBrowse_Click(object sender, RoutedEventArgs e)
