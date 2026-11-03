@@ -1,0 +1,31 @@
+<Window x:Class="rg_gui.FilePreviewWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:rg_gui"
+        Title="File Preview"
+        Height="700" Width="900"
+        WindowStartupLocation="Manual"
+        Style="{StaticResource CustomWindowStyle}"
+        Icon="pack://application:,,,/icon.ico">
+    <DataGrid x:Name="gridPreview"
+              AutoGenerateColumns="False"
+              IsReadOnly="True"
+              CanUserAddRows="False"
+              CanUserDeleteRows="False"
+              CanUserSortColumns="False"
+              GridLinesVisibility="None"
+              SelectionUnit="FullRow"
+              BorderThickness="0"
+              ScrollViewer.HorizontalScrollBarVisibility="Auto">
+        <DataGrid.Columns>
+            <DataGridTextColumn Header="Line" Binding="{Binding Line, Mode=OneWay}" Width="Auto"/>
+            <DataGridTemplateColumn Header="Content" Width="Auto">
+                <DataGridTemplateColumn.CellTemplate>
+                    <DataTemplate>
+                        <local:SelectableTextBlock local:TextBlockFormatter.Text="{Binding Content, Mode=OneWay}"/>
+                    </DataTemplate>
+                </DataGridTemplateColumn.CellTemplate>
+            </DataGridTemplateColumn>
+        </DataGrid.Columns>
+    </DataGrid>
+</Window>

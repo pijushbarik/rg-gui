@@ -14,9 +14,7 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.Windows.Interop;
 using System.Windows.Media;
-using System.Windows.Media.Media3D;
 using System.Windows.Threading;
 using static rg_gui.RipGrepWrapper;
 
@@ -54,8 +52,6 @@ namespace rg_gui
 
         private const double GRID_SPLITTER_WIDTH = 5.0;
 
-        private const int WM_MOUSEWHEEL = 0x020E;
-
         private string m_currentInput = string.Empty;
         private string? m_currentSuggestion = string.Empty;
         private string m_currentText = string.Empty;
@@ -83,10 +79,38 @@ namespace rg_gui
 
             public string Filename { get; }
 
-            public FileSearchResult(string path, string filename)
+            public string FullPath => System.IO.Path.Combine(Path, Filename);
+
+            // Path shown in the grid, relative to the search folder when possible.
+            public string DisplayPath { get; }
+
+            public FileSearchResult(string path, string filename, string basePath)
             {
                 Path = path;
                 Filename = filename;
+                DisplayPath = GetDisplayPath(basePath, FullPath);
+            }
+
+            private static string GetDisplayPath(string basePath, string fullPath)
+            {
+                if (string.IsNullOrWhiteSpace(basePath))
+                {
+                    return fullPath;
+                }
+
+                try
+                {
+                    var relative = System.IO.Path.GetRelativePath(basePath, fullPath);
+                    if (relative == "." || relative.StartsWith("..", StringComparison.Ordinal) || System.IO.Path.IsPathRooted(relative))
+                    {
+                        return fullPath;
+                    }
+                    return relative;
+                }
+                catch (ArgumentException)
+                {
+                    return fullPath;
+                }
             }
         }
 
@@ -108,8 +132,16 @@ namespace rg_gui
         private readonly RipGrepWrapper m_ripGrepWrapper;
 
         private const int FILE_LIST_REFRESH_MS = 100;
-        private readonly ConcurrentQueue<FileSearchResult> m_pendingFiles = new();
+        private readonly ConcurrentQueue<(string path, string filename)> m_pendingFiles = new();
         private readonly DispatcherTimer m_fileListTimer;
+
+        // Search terms of the most recent search, used to highlight matches in the file preview.
+        private IReadOnlyList<string> m_activeSearchTerms = Array.Empty<string>();
+        private bool m_activeIgnoreCase;
+        private bool m_activeRegularExpression;
+
+        // Folder the current results are shown relative to.
+        private string m_searchBasePath = string.Empty;
 
         public RangeObservableCollection<FileSearchResult> FileResultItems { get; } = new();
         public RangeObservableCollection<ResultLine> ResultLineItems { get; } = new();
@@ -202,7 +234,7 @@ namespace rg_gui
             m_fileViewerPath = config.AppSettings.Settings["FileViewerPath"]?.Value ?? string.Empty;
             m_fileViewerArgs = config.AppSettings.Settings["FileViewerArgs"]?.Value ?? string.Empty;
             
-            SourceInitialized += MainWindow_SourceInitialized;
+            HorizontalWheelScroll.Attach(this);
         }
 
         private static void SetConfigValue(Configuration config, string key, string value)
@@ -276,7 +308,7 @@ namespace rg_gui
         {
             // Called from the search threads. RipGrepWrapper raises this once per file, so just queue it;
             // the UI thread drains the queue in batches so the rg output readers never wait on the UI.
-            m_pendingFiles.Enqueue(new FileSearchResult(result.path, result.filename));
+            m_pendingFiles.Enqueue((result.path, result.filename));
         }
 
         private void FlushPendingFiles()
@@ -284,9 +316,8 @@ namespace rg_gui
             var added = false;
             while (m_pendingFiles.TryDequeue(out var file))
             {
-                FileResultItems.Add(file);
+                FileResultItems.Add(new FileSearchResult(file.path, file.filename, m_searchBasePath));
                 added = true;
-                
             }
 
             if (added)
@@ -295,55 +326,6 @@ namespace rg_gui
             }
         }
         
-        private void MainWindow_SourceInitialized(object? sender, EventArgs e)
-        {
-            if (PresentationSource.FromVisual(this) is HwndSource hwndSource)
-            {
-                hwndSource.AddHook(WndProc);
-            }
-        }
-        
-        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
-        {
-            if (msg == WM_MOUSEWHEEL)
-            {
-                // The high-order word of wParam holds the signed horizontal wheel delta.
-                var delta = (short)((wParam.ToInt64() >> 16) & 0xffff);
-
-                var mousePosition = PointFromScreen(new Point(
-                    (short)(lParam.ToInt64() & 0xffff),
-                    (short)((lParam.ToInt64() >> 16) & 0xffff)
-                ));
-                
-                var hit = InputHitTest(mousePosition) as DependencyObject;
-                var scrollViewer = FindAncestorScrollViewer(hit);
-                
-                if (scrollViewer != null)
-                {
-                    // Positive delta = tilt right, negative = tilt left.
-                    scrollViewer.ScrollToHorizontalOffset(scrollViewer.HorizontalOffset + (delta > 0 ? + 40 : -40));
-                    handled = true;
-                }
-            }
-            
-            return IntPtr.Zero;
-        }
-        
-        private static ScrollViewer? FindAncestorScrollViewer(DependencyObject? element)
-        {
-            while (element != null)
-            {
-                if (element is ScrollViewer scrollViewer)
-                {
-                    return scrollViewer;
-                }
-                element = (element is Visual || element is Visual3D) 
-                    ? VisualTreeHelper.GetParent(element) 
-                    : LogicalTreeHelper.GetParent(element);
-            }
-            return null;
-        }
-
         private void gridFileResults_MouseDown(object? sender, MouseEventArgs e)
         {
             if ((e.RightButton == MouseButtonState.Pressed && !SystemParameters.SwapButtons) || (e.LeftButton == MouseButtonState.Pressed && SystemParameters.SwapButtons))
@@ -387,6 +369,112 @@ namespace rg_gui
                     txtResultLineStatus.Text = $"{ResultLineItems.Count} lines matched.";
                 }
             }
+        }
+
+        private void gridFileResultsRow_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is DataGridRow { DataContext: FileSearchResult file })
+            {
+                e.Handled = true;
+                ShowFilePreview(file);
+            }
+        }
+
+        private void ShowFilePreview(FileSearchResult file)
+        {
+            const double offset = 40;
+
+            try
+            {
+                var preview = new FilePreviewWindow(file.FullPath, BuildPreviewLines(file))
+                {
+                    Owner = this
+                };
+
+                // Cascade the preview slightly down and to the right of the main window.
+                preview.Left = Left + offset;
+                preview.Top = Top + offset;
+                preview.Show();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Unable to open file:\n{ex.Message}", "Error");
+            }
+        }
+
+        private List<ResultLine> BuildPreviewLines(FileSearchResult file)
+        {
+            var lines = ReadPreviewLines(file.FullPath);
+            var previewLines = new List<ResultLine>(lines.Length);
+
+            for (var i = 0; i < lines.Length; i++)
+            {
+                previewLines.Add(new ResultLine(i + 1, GetColorizedString(lines[i], GetPreviewTermResults(lines[i]))));
+            }
+
+            return previewLines;
+        }
+
+        private string[] ReadPreviewLines(string fullPath)
+        {
+            if (cmbEncoding.SelectedIndex == (int)FileEncoding.GBK)
+            {
+                try
+                {
+                    return File.ReadAllLines(fullPath, Encoding.GetEncoding("GBK"));
+                }
+                catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+                {
+                    // Fall back to the default encoding.
+                }
+            }
+
+            return File.ReadAllLines(fullPath);
+        }
+
+        private List<TermResult> GetPreviewTermResults(string line)
+        {
+            var termResults = new List<TermResult>();
+
+            for (var termIndex = 0; termIndex < m_activeSearchTerms.Count; termIndex++)
+            {
+                var term = m_activeSearchTerms[termIndex];
+                if (string.IsNullOrEmpty(term))
+                {
+                    continue;
+                }
+
+                var options = m_activeIgnoreCase ? RegexOptions.IgnoreCase : RegexOptions.None;
+                var pattern = m_activeRegularExpression ? term : Regex.Escape(term);
+
+                try
+                {
+                    foreach (Match match in Regex.Matches(line, pattern, options))
+                    {
+                        if (match.Length > 0)
+                        {
+                            termResults.Add(new TermResult(match.Index, match.Index + match.Length - 1, termIndex));
+                        }
+                    }
+                }
+                catch (ArgumentException)
+                {
+                    // Ignore patterns .NET cannot parse.
+                }
+            }
+
+            return termResults;
+        }
+
+        // Strips the quoting used for the rg command line so the term can be matched against file contents.
+        private static string GetHighlightTerm(string term)
+        {
+            if (term.Length >= 2 && term[0] == '"' && term[term.Length - 1] == '"')
+            {
+                return term.Substring(1, term.Length - 2).Replace("\\\"", "\"");
+            }
+
+            return term;
         }
 
         private void grid_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -460,17 +548,20 @@ namespace rg_gui
             }
 
             List<string> searchTerms;
+            List<string> highlightTerms;
             if (chkSplitTerms.IsChecked ?? DEFAULT_SPLITTERMS)
             {
                 // Based on https://stackoverflow.com/questions/52194058/regex-with-escaped-double-quotes
                 searchTerms = Regex.Matches(txtContainingText.Text, @"""[^""\\]*(?:\\.[^""\\]*)*""|([^\s])+|[^\s""]+")
                     .Cast<Match>().Select(x => x.Value).ToList();
+                highlightTerms = searchTerms.Select(GetHighlightTerm).Where(x => x.Length > 0).ToList();
             }
             else
             {
                 // Search the whole text as a single phrase.
                 var phrase = txtContainingText.Text.Trim();
                 searchTerms = phrase.Length > 0 ? new List<string> { QuoteArgument(phrase) } : new List<string>();
+                highlightTerms = phrase.Length > 0 ? new List<string> { phrase } : new List<string>();
             }
 
             if (searchTerms.Count < 1)
@@ -489,6 +580,10 @@ namespace rg_gui
                 MessageBox.Show($"Search text contains more than {m_maxSearchTerms} terms.");
                 return;
             }
+
+            m_activeSearchTerms = highlightTerms;
+            m_activeIgnoreCase = !(chkCaseSensitive.IsChecked ?? false);
+            m_activeRegularExpression = chkRegularExpression.IsChecked ?? false;
 
             var stopwatch = Stopwatch.StartNew();
             btnStart.IsEnabled = false;
@@ -509,6 +604,8 @@ namespace rg_gui
             {
                 startPath = startPath.TrimEnd(Path.DirectorySeparatorChar);
             }
+
+            m_searchBasePath = startPath;
 
             try
             {
